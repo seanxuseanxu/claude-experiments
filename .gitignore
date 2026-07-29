@@ -221,5 +221,8 @@ __marimo__/
 *.fits
 *.npy
 
+# folders
+papers/*
+
 # mac
 .DS_STORE
