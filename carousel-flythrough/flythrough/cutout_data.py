@@ -12,6 +12,7 @@ import glob
 import os
 
 from astropy.io import fits
+from astropy.wcs import WCS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -24,6 +25,37 @@ MUSE_PIXEL_SCALE_ARCSEC = 0.2
 def _muse_header():
     with fits.open(os.path.join(DATA_DIR, "muse-rgb.fits")) as hdul:
         return hdul[0].header.copy()
+
+
+def muse_wcs_2d():
+    """Clean 2D WCS of the master muse-rgb.fits frame (its header carries a
+    stray NAXIS3 for the colour axis)."""
+    hdr = _muse_header()
+    hdr["NAXIS"] = 2
+    if "NAXIS3" in hdr:
+        del hdr["NAXIS3"]
+    return WCS(hdr, naxis=2)
+
+
+def muse_frame_geometry():
+    """(center_ra, center_dec, half_width_arcsec, half_height_arcsec) for the
+    full muse-rgb.fits frame.
+
+    CRVAL is *not* the centre of this frame: CRPIX sits at ~(56.5, 94.5) of a
+    340x348 grid, so CRVAL is ~28" away from the middle of the picture. The
+    centre has to be computed through the WCS. Anything that treats CRVAL as
+    the field centre (as this pipeline originally did) mis-registers the
+    billboard against the galaxies it contains by that much.
+    """
+    hdr = _muse_header()
+    nx, ny = int(hdr["NAXIS1"]), int(hdr["NAXIS2"])
+    ra, dec = muse_wcs_2d().wcs_pix2world([[(nx - 1) / 2.0, (ny - 1) / 2.0]], 0)[0]
+    return (
+        float(ra),
+        float(dec),
+        nx / 2.0 * MUSE_PIXEL_SCALE_ARCSEC,
+        ny / 2.0 * MUSE_PIXEL_SCALE_ARCSEC,
+    )
 
 
 def compute_pixel_offset(cutout_hdr, muse_hdr):

@@ -18,7 +18,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.transforms import Bbox
 
-from prepare_data import load_field_catalog, load_lensed_sources, COSMO
+from prepare_data import (
+    COSMO,
+    MUSE_HALF_H_ARCSEC,
+    MUSE_HALF_W_ARCSEC,
+    load_field_catalog,
+    load_lensed_sources,
+    sky_to_transverse_mpc,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -39,12 +46,32 @@ FPS = 30
 DURATION_S = 26.0
 N_FRAMES = int(FPS * DURATION_S)
 
-# Cluster billboard true footprint (see prepare_imagery: 340x348 px @ 0.2"/px)
-MUSE_W_ARCSEC = 340 * 0.2
-MUSE_H_ARCSEC = 348 * 0.2
+# Cluster billboard true footprint (340x348 px @ 0.2"/px), measured off the
+# frame's own WCS. The billboard is drawn centred on the origin, which is
+# only correct because the origin is the MUSE frame centre - see the
+# FIELD_CENTER note in prepare_data.py.
+MUSE_W_ARCSEC = 2 * MUSE_HALF_W_ARCSEC
+MUSE_H_ARCSEC = 2 * MUSE_HALF_H_ARCSEC
 CLUSTER_D_C = COSMO.comoving_distance(0.4895).value
 
 STAR_COLOR = (1.0, 1.0, 0.95)
+
+# --- billboard -> galaxies cross-dissolve ---------------------------------
+# From far away the field should just read as the MUSE picture. As the camera
+# closes in, that picture dissolves and the individual galaxies it is made of
+# take over. Driven by how far the camera still is from the cluster plane, and
+# finished well before the camera reaches it, so we never fly into a flat card.
+#
+# Only objects at or behind the cluster plane cross-dissolve. The three
+# genuine foreground objects (FGD at 367 Mpc, 2046 at 1104, 2292 at 1519) are
+# in front of the billboard and always drawn: the camera passes FGD long
+# before the dissolve even starts, so gating it on the dissolve means it is
+# never seen at all. Objects outside the MUSE footprint (HST fallback or
+# placeholder) aren't in the billboard picture either, so they always draw too.
+DISSOLVE_START_DEPTH = 1400.0  # Mpc in front of the cluster: billboard solid
+DISSOLVE_END_DEPTH = 600.0  # billboard fully replaced by individual galaxies
+FOREGROUND_MARGIN_MPC = 200.0  # how far in front of the cluster still counts
+# as foreground (nearest cluster member is at 1840, next object in is at 1519)
 
 
 def ease_in_out(t):
@@ -111,9 +138,13 @@ def object_angular_halfsize_deg(d_c, radius_arcsec):
 
 
 class Object3D:
-    __slots__ = ("x", "y", "d_c", "z", "rgba", "half_w_mpc", "half_h_mpc", "kind", "label", "source")
+    __slots__ = (
+        "x", "y", "d_c", "z", "rgba", "half_w_mpc", "half_h_mpc", "kind",
+        "label", "source", "dissolve",
+    )
 
-    def __init__(self, x, y, d_c, z, rgba, half_w_mpc, half_h_mpc, kind, label, source=None):
+    def __init__(self, x, y, d_c, z, rgba, half_w_mpc, half_h_mpc, kind, label,
+                 source=None, dissolve=False):
         self.x = x
         self.y = y
         self.d_c = d_c
@@ -124,6 +155,20 @@ class Object3D:
         self.kind = kind  # 'field', 'lensed'
         self.label = label
         self.source = source
+        # True if this object's light is already in the cluster billboard, so
+        # it should fade in as the billboard fades out instead of being drawn
+        # on top of its own photo. See the cross-dissolve note above.
+        self.dissolve = dissolve
+
+
+def _in_billboard(stamp, d_c):
+    """Is this object's light part of the MUSE billboard picture? Only if it
+    was cut from the MUSE frame at all, and only if it sits at or behind the
+    cluster plane the billboard is pinned to."""
+    return (
+        stamp["source"] in ("muse", "muse_arc")
+        and d_c >= CLUSTER_D_C - FOREGROUND_MARGIN_MPC
+    )
 
 
 def build_objects(field_rows, lensed_rows, stamps):
@@ -137,21 +182,46 @@ def build_objects(field_rows, lensed_rows, stamps):
         half_w = object_angular_halfsize_deg(r["d_c"], s["half_width_arcsec"])
         half_h = object_angular_halfsize_deg(r["d_c"], s["half_height_arcsec"])
         objects.append(
-            Object3D(r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_w, half_h, "field", r["label"])
+            Object3D(
+                r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_w, half_h,
+                "field", r["label"], dissolve=_in_billboard(s, r["d_c"]),
+            )
         )
+
+    # Images that share a connected footprint are cached under the first of
+    # them (prepare_imagery drops the rest), so their catalog rows have no
+    # stamp and are skipped here. They are still 41 images in the field -
+    # some of them just touch, and get drawn as one piece of sky.
     for r in lensed_rows:
         s = stamps.get(f"img_{r['label']}")
         if s is None:
             continue
+        # An arc stamp is centred on its footprint's bounding box, which is
+        # not the catalog centroid - take the position from the stamp so the
+        # pixels land where they actually are.
+        if "ra" in s:
+            x, y, _ = sky_to_transverse_mpc(s["ra"], s["dec"], r["z"])
+        else:
+            x, y = r["x"], r["y"]
         half_w = object_angular_halfsize_deg(r["d_c"], s["half_width_arcsec"])
         half_h = object_angular_halfsize_deg(r["d_c"], s["half_height_arcsec"])
         objects.append(
             Object3D(
-                r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_w, half_h,
+                x, y, r["d_c"], r["z"], s["rgba"], half_w, half_h,
                 "lensed", r["label"], r["source"],
+                dissolve=_in_billboard(s, r["d_c"]),
             )
         )
     return objects
+
+
+def billboard_alpha(cam_z):
+    """1 while the field should read as the flat MUSE picture, 0 once it has
+    been fully replaced by the individual galaxies, smoothstepped between."""
+    bb_depth = CLUSTER_D_C - cam_z
+    span = DISSOLVE_START_DEPTH - DISSOLVE_END_DEPTH
+    t = np.clip((bb_depth - DISSOLVE_END_DEPTH) / span, 0.0, 1.0)
+    return ease_in_out(t)
 
 
 NEAR_CLIP = 3.0  # Mpc; objects closer than this to the camera are culled
@@ -197,18 +267,16 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
     )
 
     # --- cluster billboard (real MUSE image), placed at its true distance ---
+    # Centred on the origin, which is the MUSE frame's own centre, so the
+    # photo lands exactly on top of the galaxies it contains.
     bb_depth = CLUSTER_D_C - cam_z
-    bb_fade = 0.0
-    if bb_depth > NEAR_CLIP:
+    bb_alpha = billboard_alpha(cam_z) if bb_depth > NEAR_CLIP else 0.0
+    if bb_alpha > 0.01:
         half_w = np.radians(MUSE_W_ARCSEC / 3600.0 / 2.0) * CLUSTER_D_C
         half_h = np.radians(MUSE_H_ARCSEC / 3600.0 / 2.0) * CLUSTER_D_C
-        bx_raw = f * half_w / bb_depth
-        by_raw = f * half_h / bb_depth
-        fade = 1.0 - np.clip((bx_raw - 3.0 * VIEW_HALF) / (6.0 * VIEW_HALF), 0, 1)
-        bx = min(bx_raw, 4.0 * VIEW_HALF)
-        by = by_raw * (bx / bx_raw) if bx_raw > 0 else by_raw
-        if bx > 0.001 and fade > 0.01:  # skip once absurdly small/far/faded
-            bb_fade = fade
+        bx = f * half_w / bb_depth
+        by = f * half_h / bb_depth
+        if bx > 0.001:  # skip once absurdly small/far
             # feather the billboard's edge so it reads as a volume, not a
             # pasted rectangular card: fade alpha to 0 over the outer ~12%
             # of the image via a soft per-pixel alpha multiplier
@@ -221,13 +289,14 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             )
             edge_alpha = np.clip(dist_to_edge, 0, 1)
             billboard_rgba = np.dstack(
-                [billboard_img[..., :3], edge_alpha * float(bb_fade)]
+                [billboard_img[..., :3], edge_alpha * float(bb_alpha)]
             )
             ax.imshow(
                 billboard_rgba,
                 extent=(-bx, bx, -by, by),
                 zorder=1,
                 interpolation="bilinear",
+                origin="lower",
             )
 
     # --- catalog objects: painter's algorithm, far to near ---
@@ -247,10 +316,10 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         d = depths[idx]
         if d <= NEAR_CLIP:
             continue
-        if o.kind == "field" and bb_depth > NEAR_CLIP and bb_fade > 0.05:
-            # cluster members are already visible in the billboard photo at
-            # essentially the same depth; only render them individually once
-            # the billboard has faded, so the cluster isn't drawn twice
+        # objects whose light is already in the billboard fade in exactly as
+        # it fades out, so the cluster is never drawn twice and never absent
+        dissolve_alpha = (1.0 - bb_alpha) if o.dissolve else 1.0
+        if dissolve_alpha <= 0.01:
             continue
         px = f * o.x / d
         py = f * o.y / d
@@ -273,25 +342,9 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             close_alpha = 1.0 - np.clip(
                 (raw_ext - FADE_START_EXT) / (FADE_END_EXT - FADE_START_EXT), 0, 1
             )
+        close_alpha *= dissolve_alpha
         if close_alpha <= 0.01:
             continue
-
-        if o.kind == "lensed":
-            # soft warm-gold glow rim behind the real stamp - a subtle
-            # accent, not a dominant flat disc, now that the stamp itself
-            # carries the real arc shape
-            glow_ext = max(half_ext_w, half_ext_h) * 1.15
-            glow_alpha = np.clip(0.35 * (150.0 / max(d, 30.0)), 0.04, 0.22) * close_alpha
-            ax.add_patch(
-                plt.Circle(
-                    (px, py),
-                    glow_ext,
-                    color=(1.0, 0.82, 0.35),
-                    alpha=glow_alpha,
-                    zorder=2,
-                    linewidth=0,
-                )
-            )
 
         ax.imshow(
             o.rgba,
@@ -299,6 +352,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             zorder=3,
             interpolation="bilinear",
             alpha=float(close_alpha),
+            origin="lower",
         )
 
         if o.kind == "lensed" and show_labels:

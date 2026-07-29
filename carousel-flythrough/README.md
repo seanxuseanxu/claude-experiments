@@ -8,11 +8,18 @@ screen is a real pixel cutout from the actual MUSE/HST imagery, placed at
 its true sky position and true cosmological distance; nothing is a
 synthetic glyph or symbol.
 
-**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~7.5MB)
+**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~5.3MB)
 
-Lensed-arc images now render with their true detected shape (segmented from
+Lensed-arc images render with their true detected shape (segmented from
 `data/cutouts/*.fits` per-source cubelets) instead of a circular cutout — see
-"Real arc shapes" below.
+"Real arc shapes" below. The cluster is a flat MUSE billboard only while it is
+far away; as the camera closes in the billboard cross-dissolves into the
+individual galaxies — see "Billboard cross-dissolve" below.
+
+The frame is in standard astronomical orientation: **North up, East left**,
+with `+x = West` and `+y = North` in scene coordinates. `output/registration_zoom.png`
+is a standing check of this — catalog positions overlaid on the MUSE frame,
+correct convention beside the old broken one.
 
 ## Quick regenerate
 
@@ -52,6 +59,19 @@ For every object: comoving distance `D_C = cosmo.comoving_distance(z)` via
 (x, y) offset in Mpc = angular offset from the field center × the object's *own* `D_C`
 (small-angle/tangent-plane approx, valid over this ~2′ field). Output: `output/scene.npz`.
 
+Two conventions here are load-bearing, and both were wrong in the first version:
+
+- **`FIELD_CENTER_*` is the geometric centre of the MUSE frame**, computed through its WCS
+  by `cutout_data.muse_frame_geometry()` — *not* `CRVAL1/CRVAL2`. `CRPIX` in
+  `muse-rgb.fits` is ~(56.5, 94.5) of a 340×348 grid, so CRVAL sits 27.9″ (−22.8″ RA,
+  +16.0″ Dec) away from the middle of the picture. This point is both the origin for
+  transverse offsets and the axis the camera flies along, so getting it wrong pasted the
+  billboard ~28″ off the galaxies inside it *and* put the camera axis 6.7″ from Source 9
+  (every other source is 28–57″ out), which made Source 9 loom over the whole flight.
+- **`x = −ΔRA·cosδ·D_C`.** RA increases eastward and the display is East-left, so x runs
+  *opposite* to RA. The original `x = +ΔRA·cosδ·D_C` mirrored every object position
+  against the imagery it was cut from.
+
 Categorization logic worth knowing about if you touch this file:
 - `z < 0.01` → tagged `"star"` (object 2357 is a foreground Milky Way star, not a galaxy —
   excluded from rendering in `flythrough.py`).
@@ -74,9 +94,20 @@ Builds two things:
   galaxies get a feathered circular alpha mask. Lensed images instead get their true detected
   shape, segmented from `data/cutouts/*.fits` — see "Real arc shapes" below.
 
-MUSE stamps get a **per-object** exposure boost (`crop / percentile99 clipped, then **0.42
-gamma`) so faint high-z sources aren't invisible next to bright cluster members — this only
-affects the small stamps, never the full billboard PNG.
+MUSE stamps get a **per-object exposure lift** (`apply_exposure`) so faint high-z sources
+aren't invisible next to bright cluster members. It is a *single scalar gain applied
+equally to R, G and B* — `gain = clip(0.85 / p99_luminance, 1.0, 8.0)` — so hue and
+saturation are preserved exactly, and anything already at full scale passes through
+identical to the billboard pixels. Measured p99 luminance over the 78 objects inside the
+MUSE footprint runs 0.09→1.00 with a median of 0.81, so most stamps are untouched and only
+the faintest arcs are really boosted. This only affects the small stamps, never the full
+billboard PNG.
+
+That "identical to the billboard" property is not cosmetic — the billboard cross-dissolves
+into these stamps, and the dissolve only reads as a dissolve if the pixels agree. The
+previous version used a per-channel `(crop / p99) ** 0.42`, which renormalised even
+already-bright galaxies up toward white and desaturated everything, since `(R/G)**0.42`
+pulls every channel ratio toward 1.
 
 A handful of sample stamps are dumped to `output/stamps/*.png` for visual spot-checking.
 
@@ -92,19 +123,35 @@ billboarded images + depth-based alpha fades + HUD text together). Key mechanics
   `FOV_DEG = 8/60` (8 arcmin) telephoto-like FOV sized to the data's actual angular scale —
   a normal-photo FOV would shrink everything to sub-pixel specks.
 - **Cluster billboard**: the full MUSE image placed at its true distance
-  (`CLUSTER_D_C`, z=0.4895) as an `imshow` with computed `extent`; capped max size + fade as
-  the camera gets very close, rather than growing into a giant flat wall.
+  (`CLUSTER_D_C`, z=0.4895) as an `imshow` with computed `extent`, centred on the origin —
+  which is only correct because the origin is the MUSE frame's own centre. It cross-
+  dissolves into the individual galaxies as the camera approaches (see below) rather than
+  growing into a giant flat wall.
 - **Every other object** (field galaxies, cluster members, foreground dwarf, each lensed
   image) is rendered as its own real stamp from step 2 via painter's algorithm (`imshow`,
   far-to-near depth order), scaled by real angular size × its own comoving distance so
   perspective growth is physically consistent.
+- **`origin="lower"` on every `imshow`.** `muse-rgb.fits` has `PC2_2 = +5.556e-05`, i.e.
+  pixel row +1 → Dec increases, so the array must be drawn bottom-up to put North up.
+  matplotlib's default `origin="upper"` renders the whole field upside down.
+- **Billboard cross-dissolve**: `billboard_alpha()` smoothsteps 1→0 as the camera's distance
+  from the cluster plane closes from `DISSOLVE_START_DEPTH = 1400` to `DISSOLVE_END_DEPTH =
+  600` Mpc (≈1.6 s → 4.3 s in), and every object whose light is already *in* that photo
+  fades in on `1 − bb_alpha`. So the field reads as the flat MUSE picture from far away and
+  as real 3D galaxies up close, with nothing drawn twice and nothing missing in between.
+  `Object3D.dissolve` marks who participates, via `_in_billboard()`: an object counts only
+  if its stamp came from the MUSE frame *and* it sits at or behind the cluster plane
+  (`CLUSTER_D_C − FOREGROUND_MARGIN_MPC`). The three genuine foreground objects — FGD at
+  367 Mpc, 2046 at 1104, 2292 at 1519 — and everything outside the MUSE footprint always
+  draw at full alpha. That exemption matters: the camera passes FGD at `cam_z ≈ 367`, long
+  before the dissolve starts, so gating it on the dissolve means it is never seen at all.
 - **Near-object handling**: apparent size scales ~1/depth, so without limits, close objects
   would balloon into opaque full-frame walls. `MAX_EXT` caps displayed size; alpha dissolves
   out beyond that (`FADE_START_EXT`→`FADE_END_EXT`) so passing close reads as flying *through*
   something, not slamming into a card.
-- **Lensed sources** get one extra cue on top of their real stamp: a soft warm-gold glow
-  circle behind it (`(1.0, 0.82, 0.35)`, depth-modulated alpha) so the scientific highlights
-  are easy to spot — the underlying stamp shape/color is never altered.
+- **Lensed sources** get no synthetic highlight — just their real stamp and a text label.
+  An earlier version drew a warm-gold glow circle behind each one; it read as bokeh on the
+  distant arcs and as a flat tan disc on the near ones, and it is gone.
 - **Labels**: `"Source N\nz=..."` fading text near each lensed source as the camera
   approaches/passes (`_alpha_for_depth_fade`, tuned by `LABEL_FADE_IN_MPC`/`LABEL_FADE_OUT_MPC`).
 - **HUD**: corner readout of current `z` and `D_C` in Mpc.
@@ -130,6 +177,19 @@ billboarded images + depth-based alpha fades + HUD text together). Key mechanics
   `flythrough.py` (`build_objects`) as a foreground Milky Way star, not a galaxy.
 - **Source 10** has two lensed images but no confirmed spectroscopic redshift in the paper —
   excluded entirely (`load_lensed_sources` skips `z is None` rows).
+- **CRVAL is not the centre of `muse-rgb.fits`.** `CRPIX ≈ (56.5, 94.5)` in a 340×348 frame,
+  so CRVAL is 27.9″ off the middle of the picture. Treating it as the field centre (which
+  this pipeline did originally) silently mis-registers the billboard against its own
+  galaxies. Always go through `cutout_data.muse_frame_geometry()`.
+- **FITS row order vs matplotlib.** `PC2_2 > 0` means row +1 → Dec increases, so these
+  arrays need `origin="lower"`. Every `imshow` of MUSE-derived pixels must pass it, and the
+  cached arrays in `stamps.npy` are kept in FITS row order — the spot-check PNGs in
+  `output/stamps/` are `flipud`'d *only* on save so they look right in an image viewer.
+- **Two independent mirror bugs cancel out under inspection.** The original code had East on
+  the right in scene coordinates *and* North down in the imagery. Each is a mirror, so
+  eyeballing a single frame can look merely "rotated" rather than wrong. Check them
+  separately, with `output/registration_zoom.png` (catalog markers over the MUSE frame) —
+  when both conventions are right, every marker sits on a galaxy core.
 
 ## Real arc shapes (added 2026-07-29)
 
@@ -148,10 +208,27 @@ image's true footprint from its own `S/N = DATA/sqrt(STAT)` map (threshold
 labeled), lightly feathers the binary mask, and crops real MUSE RGB color
 using that shape as alpha — replacing the circular stamp for the 39 of 41
 lensed images that have a cutout (`2a` and `7d` have no cutout and keep the
-old circular path). Where multiple images in one file share a connected blob
-at that threshold (`{3a,3b,3c}`, `{5a,5b}`, `{9a,9b}`, `{12a,12b}` — raising
-the threshold does not cleanly separate these without shrinking real extent),
-pixels are split by nearest catalog centroid instead.
+old circular path).
+
+**One stamp per connected blob.** Where several catalogued images share a
+connected footprint at that threshold — `{3a,3b,3c}`, `{5a,5b}`, `{8a,8b}`,
+`{9a,9b}`, `{12a,12b}` — they are drawn as a single piece of sky, keyed by the
+first of them, with the rest listed in `merged_labels` and dropped from the
+stamp cache so the renderer can't draw the same pixels twice. So 41 lensed
+images render as 35 stamps. That is a statement about footprints and not a
+recount: the field still has 41 images, some of which happen to touch, the same
+way an Einstein ring is still four images.
+
+An earlier version split these shared blobs by nearest catalog centroid. That
+carved one real blob into Voronoi wedges whose bounding boxes were wildly
+elongated — it is where the old "`8a` is ~58:1 elongated" note came from. With
+blobs kept whole the largest aspect ratio in the whole set is 3.07:1.
+
+`ra`/`dec` on an arc stamp are the sky position of its **bounding-box centre**,
+which is what the renderer centres the stamp on. That is not the same point as
+any catalog centroid, so `flythrough.py::build_objects` takes arc positions
+from the stamp rather than the catalog row; positioning an arc on its centroid
+(as this originally did) offsets the pixels from where they belong.
 
 Lensed-image RA/Dec now also comes from the cutout's own `CENTROIDS` table
 (`sky_centroid.ra/dec`, fit directly from the data) rather than the
@@ -163,31 +240,39 @@ excluded, same rule as Source 10.
 Stamps are no longer forced square: `stamps.npy` entries carry
 `half_width_arcsec`/`half_height_arcsec` separately (was a single
 `radius_arcsec`), and `Object3D` in `flythrough.py` carries `half_w_mpc`/
-`half_h_mpc` so elongated arcs (e.g. image 8a is ~58:1 elongated) render at
-their true aspect ratio instead of being squashed back toward circular.
+`half_h_mpc` so elongated arcs render at their true aspect ratio instead of
+being squashed back toward circular.
 
-Same pass also resolved the render-bug half of the original critique (all in
-`flythrough.py`): cluster members are no longer drawn both as the billboard
-*and* individually at the same depth (members now only render once the
-billboard has faded); the billboard's rectangular edge is feathered; the
-lensed-source glow is a subtle accent, not a dominant flat disc; multiple
+An earlier pass also resolved the render-bug half of the original critique (all
+in `flythrough.py`): the billboard's rectangular edge is feathered; multiple
 images of one source share a single "Source N" label instead of repeating it;
 and the neutral placeholder used for the ~17 objects with no MUSE/HST coverage
-is now dim and small instead of a prominent blue-gray blob.
+is dim and small instead of a prominent blue-gray blob.
 
 Not addressed (data-resolution limit, not a rendering bug): stamp resolution
 still collapses to a handful of real-but-noisy pixels at the highest
 redshifts (e.g. z≈3–4 images).
 
+**Known open issue — field galaxies are still circles.** Arcs got real
+segmented shapes, but catalog galaxies still use `_feathered_alpha`, a plain
+feathered circle. That was invisible while the billboard covered the cluster;
+now that the billboard dissolves into them, they read as soft bokeh discs in
+the close approach (`cam_z ≈ 1700`). Two things would fix it, neither done:
+give each stamp an alpha derived from its own light rather than a circle, and
+borrow luminance from `hubble_f140w.fits` (0.07″/px vs MUSE's 0.2″/px) while
+keeping MUSE colour, since a 2.5″ MUSE stamp is only ~25 px and is upscaled
+~10× at closest approach.
+
 ## Likely next tweaks (if asked to refine)
 
 - Camera speed/timing: `Z_START`, `Z_END`, `DURATION_S`, `ease_frac` in `flythrough.py`.
 - FOV / how large things appear: `FOV_DEG`.
-- Glow color/strength on lensed sources: the `glow_ext`/`glow_alpha`/color block in
-  `render_frame()`.
+- When the billboard gives way to individual galaxies: `DISSOLVE_START_DEPTH`,
+  `DISSOLVE_END_DEPTH`.
 - Label timing/fade: `LABEL_FADE_IN_MPC`, `LABEL_FADE_OUT_MPC`.
-- Stamp exposure/contrast for faint sources: the `0.42` gamma and 99th-percentile norm in
-  `prepare_imagery.py::extract_stamp`.
+- Stamp exposure/contrast for faint sources: `EXPOSURE_TARGET`, `EXPOSURE_MAX_GAIN` in
+  `prepare_imagery.py`. Keep the gain floored at 1.0 or bright stamps stop matching the
+  billboard and the cross-dissolve starts to show a seam.
 - Stamp cutout size: `STAMP_RADIUS_ARCSEC` in `prepare_imagery.py` (currently 2.5″;
   re-run `prepare_imagery.py` after changing).
 - Output resolution/quality: `--fig-size`/`--dpi` flags, or the defaults in `main()`

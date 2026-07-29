@@ -21,7 +21,7 @@ from astropy.cosmology import FlatLambdaCDM
 import astropy.units as u
 
 from lensed_sources import LENSED_IMAGES, source_label
-from cutout_data import load_lensed_image_centroids
+from cutout_data import load_lensed_image_centroids, muse_frame_geometry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,10 +30,17 @@ CATALOG_PATH = os.path.join(
 )
 OUT_PATH = os.path.join(ROOT, "output/scene.npz")
 
-# MUSE pointing center (from data/muse-rgb.fits CRVAL1/CRVAL2), also used
-# as the field center for transverse offsets.
-FIELD_CENTER_RA = 90.9957461
-FIELD_CENTER_DEC = -35.97494928
+# Field center for transverse offsets, and therefore the axis the camera
+# flies along. This is the geometric centre of the MUSE frame, computed
+# through its WCS -- NOT CRVAL1/CRVAL2, which this file originally used.
+# CRPIX in muse-rgb.fits is ~(56.5, 94.5) of a 340x348 grid, so CRVAL sits
+# ~28" (-22.8" RA, +16.0" Dec) from the middle of the picture. Using CRVAL
+# both pasted the billboard ~28" off from the galaxies inside it and put the
+# camera axis almost exactly through Source 9 (6.7" off it, versus 28-57"
+# for every other source), which made Source 9 loom over the whole flight.
+FIELD_CENTER_RA, FIELD_CENTER_DEC, MUSE_HALF_W_ARCSEC, MUSE_HALF_H_ARCSEC = (
+    muse_frame_geometry()
+)
 
 CLUSTER_Z = 0.4895  # biweight central redshift from the paper
 
@@ -45,13 +52,21 @@ def sky_to_transverse_mpc(ra_deg, dec_deg, z):
     """Comoving transverse (x, y) offset in Mpc from the field center, at
     the object's own comoving distance (proper transverse comoving distance,
     i.e. angular offset * D_C, using a small-angle/tangent-plane approximation
-    valid over this ~2' field)."""
+    valid over this ~2' field).
+
+    Orientation is standard astronomical: +x is West and +y is North, so the
+    rendered frame reads North-up / East-left, the same way the MUSE pixels
+    do. Note the sign on x: RA increases *eastward*, so East-left means x
+    runs opposite to RA. Getting this wrong mirrors every object position
+    against the imagery it was cut from, which is what the first version of
+    this pipeline did.
+    """
     center = SkyCoord(FIELD_CENTER_RA * u.deg, FIELD_CENTER_DEC * u.deg)
     obj = SkyCoord(ra_deg * u.deg, dec_deg * u.deg)
     dra = (obj.ra - center.ra).wrap_at(180 * u.deg).radian * np.cos(center.dec.radian)
     ddec = (obj.dec - center.dec).radian
     d_c = COSMO.comoving_distance(z).to(u.Mpc).value
-    x = dra * d_c
+    x = -dra * d_c
     y = ddec * d_c
     return x, y, d_c
 
