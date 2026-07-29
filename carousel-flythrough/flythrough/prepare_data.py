@@ -21,6 +21,7 @@ from astropy.cosmology import FlatLambdaCDM
 import astropy.units as u
 
 from lensed_sources import LENSED_IMAGES, source_label
+from cutout_data import load_lensed_image_centroids
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -94,18 +95,32 @@ def load_field_catalog():
 
 
 def load_lensed_sources():
+    # data/cutouts/*.fits carries a WCS-fit centroid (CENTROIDS table) for
+    # most images, fit directly from the data rather than transcribed by
+    # hand from the paper's sexagesimal table - more accurate where present.
+    # Only used for position; redshift still comes from LENSED_IMAGES, since
+    # the cutouts carry no redshift info. Note: source8.fits also contains
+    # an untranscribed "8d" image with no confirmed redshift - naturally
+    # excluded here since we iterate LENSED_IMAGES, not the cutout catalog.
+    cutout_centroids = load_lensed_image_centroids()
+
     rows = []
     for image_label, ra_s, dec_s, z in LENSED_IMAGES:
         if z is None:
             continue  # Source 10: no confirmed redshift, excluded
-        c = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg))
-        x, y, d_c = sky_to_transverse_mpc(c.ra.deg, c.dec.deg, z)
+        cutout = cutout_centroids.get(image_label)
+        if cutout is not None:
+            ra_deg, dec_deg = cutout["ra"], cutout["dec"]
+        else:
+            c = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg))
+            ra_deg, dec_deg = c.ra.deg, c.dec.deg
+        x, y, d_c = sky_to_transverse_mpc(ra_deg, dec_deg, z)
         rows.append(
             dict(
                 label=image_label,
                 source=source_label(image_label),
-                ra=c.ra.deg,
-                dec=c.dec.deg,
+                ra=ra_deg,
+                dec=dec_deg,
                 z=z,
                 x=x,
                 y=y,

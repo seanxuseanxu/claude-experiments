@@ -8,7 +8,11 @@ screen is a real pixel cutout from the actual MUSE/HST imagery, placed at
 its true sky position and true cosmological distance; nothing is a
 synthetic glyph or symbol.
 
-**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~10MB)
+**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~7.5MB)
+
+Lensed-arc images now render with their true detected shape (segmented from
+`data/cutouts/*.fits` per-source cubelets) instead of a circular cutout — see
+"Real arc shapes" below.
 
 ## Quick regenerate
 
@@ -66,8 +70,9 @@ Builds two things:
 - **`output/stamps.npy`** — a dict of small RGBA cutouts, one per catalog galaxy and one per
   individual lensed image, each centered on that object's true RA/Dec. Preference order:
   MUSE RGB (true color, 0.2″/px) → HST F140W (grayscale fallback, 0.07″/px, arcsinh-stretched)
-  → a small dim neutral placeholder for the ~17 objects covered by neither footprint. Each
-  stamp gets a feathered circular alpha mask so it composites without hard edges.
+  → a small dim neutral placeholder for the ~17 objects covered by neither footprint. Field
+  galaxies get a feathered circular alpha mask. Lensed images instead get their true detected
+  shape, segmented from `data/cutouts/*.fits` — see "Real arc shapes" below.
 
 MUSE stamps get a **per-object** exposure boost (`crop / percentile99 clipped, then **0.42
 gamma`) so faint high-z sources aren't invisible next to bright cluster members — this only
@@ -125,6 +130,54 @@ billboarded images + depth-based alpha fades + HUD text together). Key mechanics
   `flythrough.py` (`build_objects`) as a foreground Milky Way star, not a galaxy.
 - **Source 10** has two lensed images but no confirmed spectroscopic redshift in the paper —
   excluded entirely (`load_lensed_sources` skips `z is None` rows).
+
+## Real arc shapes (added 2026-07-29)
+
+The first render stamped every object — including lensed arcs — into a small
+feathered *circle*, flattening arc morphology into bokeh dots (see git history
+for the original critique). The user then supplied `data/cutouts/*.fits`: one
+FITS cubelet per source (or small source group), with `DATA`/`STAT`/`MASK`
+(hot pixels + unrelated contaminating sources, not the source's own shape)
+/`CENTROIDS` (per-image WCS-fit position)/`PSF` extensions, continuum-subtracted
+and pixel-aligned with `data/muse-rgb.fits` (confirmed: same CD matrix and
+CRVAL, integer pixel offset only — see `cutout_data.py`).
+
+`prepare_imagery.py::build_lensed_image_masks()` now segments each lensed
+image's true footprint from its own `S/N = DATA/sqrt(STAT)` map (threshold
+`ARC_SN_THRESHOLD = 2.0`, `MASK==0` pixels excluded, connected-component
+labeled), lightly feathers the binary mask, and crops real MUSE RGB color
+using that shape as alpha — replacing the circular stamp for the 39 of 41
+lensed images that have a cutout (`2a` and `7d` have no cutout and keep the
+old circular path). Where multiple images in one file share a connected blob
+at that threshold (`{3a,3b,3c}`, `{5a,5b}`, `{9a,9b}`, `{12a,12b}` — raising
+the threshold does not cleanly separate these without shrinking real extent),
+pixels are split by nearest catalog centroid instead.
+
+Lensed-image RA/Dec now also comes from the cutout's own `CENTROIDS` table
+(`sky_centroid.ra/dec`, fit directly from the data) rather than the
+hand-transcribed `lensed_sources.py` table, for the 40 images that have one —
+more accurate than the paper's rounded sexagesimal positions. `source8.fits`
+contains an extra untranscribed image, `8d`, with no confirmed redshift;
+excluded, same rule as Source 10.
+
+Stamps are no longer forced square: `stamps.npy` entries carry
+`half_width_arcsec`/`half_height_arcsec` separately (was a single
+`radius_arcsec`), and `Object3D` in `flythrough.py` carries `half_w_mpc`/
+`half_h_mpc` so elongated arcs (e.g. image 8a is ~58:1 elongated) render at
+their true aspect ratio instead of being squashed back toward circular.
+
+Same pass also resolved the render-bug half of the original critique (all in
+`flythrough.py`): cluster members are no longer drawn both as the billboard
+*and* individually at the same depth (members now only render once the
+billboard has faded); the billboard's rectangular edge is feathered; the
+lensed-source glow is a subtle accent, not a dominant flat disc; multiple
+images of one source share a single "Source N" label instead of repeating it;
+and the neutral placeholder used for the ~17 objects with no MUSE/HST coverage
+is now dim and small instead of a prominent blue-gray blob.
+
+Not addressed (data-resolution limit, not a rendering bug): stamp resolution
+still collapses to a handful of real-but-noisy pixels at the highest
+redshifts (e.g. z≈3–4 images).
 
 ## Likely next tweaks (if asked to refine)
 

@@ -17,10 +17,12 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
+from scipy import ndimage
 import astropy.units as u
 from PIL import Image
 
 from prepare_data import load_field_catalog, load_lensed_sources
+from cutout_data import iter_cutouts, MUSE_PIXEL_SCALE_ARCSEC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,6 +32,17 @@ STAMP_DIR = os.path.join(OUT_DIR, "stamps")
 
 STAMP_RADIUS_ARCSEC = 2.5  # half-width of each cutout
 FEATHER_FRAC = 0.35  # fraction of radius over which alpha falls off
+
+# --- lensed-image arc shapes, from data/cutouts/*.fits ---------------------
+# Each cutout carries DATA/STAT/MASK/CENTROIDS for one source (or small
+# group of sources). We segment each image's true detected footprint from
+# its own S/N map instead of stamping it into a circle, so arcs render as
+# arcs. See cutout_data.py for the pixel-grid alignment this relies on.
+ARC_SN_THRESHOLD = 2.0  # S/N above which a pixel counts as "the source"
+ARC_FEATHER_SIGMA_PX = 0.8  # gaussian blur applied to the binary mask edge
+ARC_BBOX_PAD_PX = 4  # margin around the detected footprint, for feathering
+ARC_BLOB_SEARCH_RADIUS_PX = 5  # how far to look if a centroid pixel itself
+# falls just under threshold (confirmed needed for 3 of 41 images)
 
 
 def _wcs_2d_from_header(hdr):
@@ -118,15 +131,106 @@ def extract_stamp(ra_deg, dec_deg, muse_rgb, muse_wcs, hst_rgb, hst_wcs, radius_
         rgba = np.dstack([boosted, alpha])
         return rgba, name, radius_arcsec
 
-    # neither image covers this position
+    # neither image covers this position - a dim, small, low-contrast fill
+    # so the ~17 uncovered objects recede into the background rather than
+    # reading as a prominent blob/artifact next to real imagery
     size = 9
-    alpha = _feathered_alpha(size) * 0.6
-    rgb_fill = np.zeros((size, size, 3))
-    rgb_fill[..., 2] = 0.35  # dim blue-gray placeholder
-    rgb_fill[..., 0] = 0.15
-    rgb_fill[..., 1] = 0.2
+    alpha = _feathered_alpha(size) * 0.25
+    rgb_fill = np.full((size, size, 3), 0.12)
     rgba = np.dstack([rgb_fill, alpha])
-    return rgba, "none", radius_arcsec
+    return rgba, "none", radius_arcsec * 0.6
+
+
+def _nearest_labeled_pixel(labeled, iy, ix, max_r=ARC_BLOB_SEARCH_RADIUS_PX):
+    """labeled[iy, ix] if nonzero, else the label of the nearest nonzero
+    pixel within max_r (a handful of centroids sit a pixel or two below the
+    S/N threshold - confirmed true for 3 of 41 images)."""
+    if labeled[iy, ix] != 0:
+        return labeled[iy, ix]
+    ny, nx = labeled.shape
+    for r in range(1, max_r + 1):
+        y0, y1 = max(0, iy - r), min(ny - 1, iy + r)
+        x0, x1 = max(0, ix - r), min(nx - 1, ix + r)
+        sub = labeled[y0 : y1 + 1, x0 : x1 + 1]
+        ys, xs = np.where(sub > 0)
+        if len(ys):
+            yy, xx = ys + y0, xs + x0
+            d2 = (yy - iy) ** 2 + (xx - ix) ** 2
+            k = np.argmin(d2)
+            return sub[ys[k], xs[k]]
+    return 0
+
+
+def build_lensed_image_masks(muse_rgb):
+    """label ('8a') -> dict(rgba, half_width_arcsec, half_height_arcsec) for
+    every lensed image that has a data/cutouts/*.fits cubelet, segmenting
+    its true detected footprint instead of stamping it into a circle.
+
+    Approach per cutout file: threshold the S/N map (DATA/sqrt(STAT), with
+    MASK==0 pixels - hot pixels / unrelated contaminating sources - zeroed
+    out first) and connected-component label it. Where multiple images in
+    one file share a connected blob (confirmed for {3a,3b,3c}, {5a,5b},
+    {9a,9b}, {12a,12b}), split the shared blob by nearest catalog centroid
+    rather than raising the threshold, which shrinks real extent unevenly
+    per image. The resulting binary mask is lightly feathered and its pixel
+    footprint (known pixel-aligned with muse-rgb.fits, see cutout_data.py)
+    is used to crop real MUSE RGB color for the stamp - only the alpha
+    source changes from a circle to the real shape."""
+    out = {}
+    for path, data, stat, mask, centroids, dx, dy in iter_cutouts():
+        sn = np.where(mask == 1, data / np.sqrt(stat), 0.0)
+        labeled, _n = ndimage.label(sn > ARC_SN_THRESHOLD)
+
+        pix_centroid = {
+            str(row["Source name"]): row["pix_centroid"] for row in centroids
+        }
+        blob_id = {
+            name: _nearest_labeled_pixel(labeled, int(round(cy)), int(round(cx)))
+            for name, (cx, cy) in pix_centroid.items()
+        }
+
+        # group images sharing one blob so we can split it by nearest centroid
+        by_blob = {}
+        for name, bid in blob_id.items():
+            by_blob.setdefault(bid, []).append(name)
+
+        ny, nx = labeled.shape
+        for bid, names in by_blob.items():
+            ys, xs = np.where(labeled == bid)
+            if len(names) == 1:
+                owner = np.zeros(len(xs), dtype=int)
+            else:
+                pts = np.array([pix_centroid[n] for n in names])  # (x, y) per name
+                d2 = (xs[:, None] - pts[None, :, 0]) ** 2 + (ys[:, None] - pts[None, :, 1]) ** 2
+                owner = np.argmin(d2, axis=1)
+
+            for i, name in enumerate(names):
+                sel = owner == i
+                oys, oxs = ys[sel], xs[sel]
+                y0 = max(0, oys.min() - ARC_BBOX_PAD_PX)
+                y1 = min(ny - 1, oys.max() + ARC_BBOX_PAD_PX)
+                x0 = max(0, oxs.min() - ARC_BBOX_PAD_PX)
+                x1 = min(nx - 1, oxs.max() + ARC_BBOX_PAD_PX)
+
+                local_mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1))
+                local_mask[oys - y0, oxs - x0] = 1.0
+                alpha = ndimage.gaussian_filter(local_mask, ARC_FEATHER_SIGMA_PX)
+                alpha = np.clip(alpha / max(alpha.max(), 1e-9), 0, 1)
+
+                my0, my1 = y0 + dy, y1 + dy
+                mx0, mx1 = x0 + dx, x1 + dx
+                crop = muse_rgb[my0 : my1 + 1, mx0 : mx1 + 1, :]
+                # same per-stamp exposure boost as extract_stamp's MUSE path
+                norm = max(np.percentile(crop, 99.0), 1e-3)
+                boosted = np.clip(crop / norm, 0, 1) ** 0.42
+
+                rgba = np.dstack([boosted, alpha])
+                out[name] = dict(
+                    rgba=rgba,
+                    half_width_arcsec=(x1 - x0 + 1) / 2.0 * MUSE_PIXEL_SCALE_ARCSEC,
+                    half_height_arcsec=(y1 - y0 + 1) / 2.0 * MUSE_PIXEL_SCALE_ARCSEC,
+                )
+    return out
 
 
 def build_all_stamps():
@@ -143,13 +247,38 @@ def build_all_stamps():
     for r in field_rows + lensed_rows:
         rgba, source, radius = extract_stamp(r["ra"], r["dec"], muse_rgb, muse_wcs, hst_rgb, hst_wcs)
         key = r["label"] if "source" not in r else f"img_{r['label']}"
-        stamps[key] = dict(rgba=rgba, source=source, radius_arcsec=radius)
+        stamps[key] = dict(
+            rgba=rgba, source=source,
+            half_width_arcsec=radius, half_height_arcsec=radius,
+        )
         counts[source] += 1
+
+    # Lensed images with a data/cutouts/*.fits cubelet get their true
+    # detected (generally non-circular) shape instead of the circular stamp
+    # above - overrides the img_<label> entries just written.
+    arc_masks = build_lensed_image_masks(muse_rgb)
+    counts["muse_arc"] = 0
+    for label, arc in arc_masks.items():
+        key = f"img_{label}"
+        if key not in stamps:
+            continue  # e.g. img_8d: has a cutout but isn't in the catalog (no confirmed z)
+        counts[stamps[key]["source"]] -= 1
+        stamps[key] = dict(
+            rgba=arc["rgba"], source="muse_arc",
+            half_width_arcsec=arc["half_width_arcsec"],
+            half_height_arcsec=arc["half_height_arcsec"],
+        )
+        counts["muse_arc"] += 1
 
     print("Stamp sources:", counts)
 
-    # dump a handful to disk for visual inspection
-    sample_keys = list(stamps.keys())[:6] + [k for k in stamps if k.startswith("img_")][:6]
+    # dump a handful to disk for visual inspection, including a few
+    # high-elongation arcs to confirm shape (not circular) and clean edges
+    sample_keys = (
+        list(stamps.keys())[:6]
+        + [k for k in stamps if k.startswith("img_")][:6]
+        + [f"img_{lbl}" for lbl in ("8a", "12a", "6d") if f"img_{lbl}" in stamps]
+    )
     for k in dict.fromkeys(sample_keys):
         rgba = stamps[k]["rgba"]
         img = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)

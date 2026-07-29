@@ -111,15 +111,16 @@ def object_angular_halfsize_deg(d_c, radius_arcsec):
 
 
 class Object3D:
-    __slots__ = ("x", "y", "d_c", "z", "rgba", "half_size_mpc", "kind", "label", "source")
+    __slots__ = ("x", "y", "d_c", "z", "rgba", "half_w_mpc", "half_h_mpc", "kind", "label", "source")
 
-    def __init__(self, x, y, d_c, z, rgba, half_size_mpc, kind, label, source=None):
+    def __init__(self, x, y, d_c, z, rgba, half_w_mpc, half_h_mpc, kind, label, source=None):
         self.x = x
         self.y = y
         self.d_c = d_c
         self.z = z
         self.rgba = rgba
-        self.half_size_mpc = half_size_mpc
+        self.half_w_mpc = half_w_mpc
+        self.half_h_mpc = half_h_mpc
         self.kind = kind  # 'field', 'lensed'
         self.label = label
         self.source = source
@@ -133,18 +134,21 @@ def build_objects(field_rows, lensed_rows, stamps):
         s = stamps.get(r["label"])
         if s is None:
             continue
-        half_size = object_angular_halfsize_deg(r["d_c"], s["radius_arcsec"])
+        half_w = object_angular_halfsize_deg(r["d_c"], s["half_width_arcsec"])
+        half_h = object_angular_halfsize_deg(r["d_c"], s["half_height_arcsec"])
         objects.append(
-            Object3D(r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_size, "field", r["label"])
+            Object3D(r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_w, half_h, "field", r["label"])
         )
     for r in lensed_rows:
         s = stamps.get(f"img_{r['label']}")
         if s is None:
             continue
-        half_size = object_angular_halfsize_deg(r["d_c"], s["radius_arcsec"])
+        half_w = object_angular_halfsize_deg(r["d_c"], s["half_width_arcsec"])
+        half_h = object_angular_halfsize_deg(r["d_c"], s["half_height_arcsec"])
         objects.append(
             Object3D(
-                r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_size, "lensed", r["label"], r["source"]
+                r["x"], r["y"], r["d_c"], r["z"], s["rgba"], half_w, half_h,
+                "lensed", r["label"], r["source"],
             )
         )
     return objects
@@ -194,21 +198,36 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
 
     # --- cluster billboard (real MUSE image), placed at its true distance ---
     bb_depth = CLUSTER_D_C - cam_z
+    bb_fade = 0.0
     if bb_depth > NEAR_CLIP:
         half_w = np.radians(MUSE_W_ARCSEC / 3600.0 / 2.0) * CLUSTER_D_C
         half_h = np.radians(MUSE_H_ARCSEC / 3600.0 / 2.0) * CLUSTER_D_C
         bx_raw = f * half_w / bb_depth
         by_raw = f * half_h / bb_depth
-        bb_fade = 1.0 - np.clip((bx_raw - 3.0 * VIEW_HALF) / (6.0 * VIEW_HALF), 0, 1)
+        fade = 1.0 - np.clip((bx_raw - 3.0 * VIEW_HALF) / (6.0 * VIEW_HALF), 0, 1)
         bx = min(bx_raw, 4.0 * VIEW_HALF)
         by = by_raw * (bx / bx_raw) if bx_raw > 0 else by_raw
-        if bx > 0.001 and bb_fade > 0.01:  # skip once absurdly small/far/faded
+        if bx > 0.001 and fade > 0.01:  # skip once absurdly small/far/faded
+            bb_fade = fade
+            # feather the billboard's edge so it reads as a volume, not a
+            # pasted rectangular card: fade alpha to 0 over the outer ~12%
+            # of the image via a soft per-pixel alpha multiplier
+            bh_img, bw_img = billboard_img.shape[:2]
+            yy, xx = np.mgrid[0:bh_img, 0:bw_img]
+            edge_frac = 0.12
+            dist_to_edge = np.minimum(
+                np.minimum(xx, bw_img - 1 - xx) / (bw_img * edge_frac),
+                np.minimum(yy, bh_img - 1 - yy) / (bh_img * edge_frac),
+            )
+            edge_alpha = np.clip(dist_to_edge, 0, 1)
+            billboard_rgba = np.dstack(
+                [billboard_img[..., :3], edge_alpha * float(bb_fade)]
+            )
             ax.imshow(
-                billboard_img,
+                billboard_rgba,
                 extent=(-bx, bx, -by, by),
                 zorder=1,
                 interpolation="bilinear",
-                alpha=float(bb_fade),
             )
 
     # --- catalog objects: painter's algorithm, far to near ---
@@ -228,15 +247,24 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         d = depths[idx]
         if d <= NEAR_CLIP:
             continue
+        if o.kind == "field" and bb_depth > NEAR_CLIP and bb_fade > 0.05:
+            # cluster members are already visible in the billboard photo at
+            # essentially the same depth; only render them individually once
+            # the billboard has faded, so the cluster isn't drawn twice
+            continue
         px = f * o.x / d
         py = f * o.y / d
-        raw_ext = f * o.half_size_mpc / d
-        half_ext = min(raw_ext, MAX_EXT)
-        if px + half_ext < -VIEW_HALF * 1.3 or px - half_ext > VIEW_HALF * 1.3:
+        raw_ext_w = f * o.half_w_mpc / d
+        raw_ext_h = f * o.half_h_mpc / d
+        raw_ext = max(raw_ext_w, raw_ext_h)
+        scale = min(raw_ext, MAX_EXT) / raw_ext if raw_ext > 0 else 1.0
+        half_ext_w = raw_ext_w * scale
+        half_ext_h = raw_ext_h * scale
+        if px + half_ext_w < -VIEW_HALF * 1.3 or px - half_ext_w > VIEW_HALF * 1.3:
             continue
-        if py + half_ext < -VIEW_HALF * 1.3 or py - half_ext > VIEW_HALF * 1.3:
+        if py + half_ext_h < -VIEW_HALF * 1.3 or py - half_ext_h > VIEW_HALF * 1.3:
             continue
-        if half_ext < 0.0008:
+        if max(half_ext_w, half_ext_h) < 0.0008:
             continue
 
         if raw_ext <= FADE_START_EXT:
@@ -249,9 +277,11 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             continue
 
         if o.kind == "lensed":
-            # soft warm-gold glow rim behind the real stamp
-            glow_ext = half_ext * 1.5
-            glow_alpha = np.clip(0.5 * (300.0 / max(d, 30.0)), 0.08, 0.5) * close_alpha
+            # soft warm-gold glow rim behind the real stamp - a subtle
+            # accent, not a dominant flat disc, now that the stamp itself
+            # carries the real arc shape
+            glow_ext = max(half_ext_w, half_ext_h) * 1.15
+            glow_alpha = np.clip(0.35 * (150.0 / max(d, 30.0)), 0.04, 0.22) * close_alpha
             ax.add_patch(
                 plt.Circle(
                     (px, py),
@@ -265,7 +295,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
 
         ax.imshow(
             o.rgba,
-            extent=(px - half_ext, px + half_ext, py - half_ext, py + half_ext),
+            extent=(px - half_ext_w, px + half_ext_w, py - half_ext_h, py + half_ext_h),
             zorder=3,
             interpolation="bilinear",
             alpha=float(close_alpha),
@@ -274,9 +304,17 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         if o.kind == "lensed" and show_labels:
             alpha = _alpha_for_depth_fade(d, LABEL_FADE_IN_MPC, LABEL_FADE_OUT_MPC) * close_alpha
             if alpha > 0.01:
-                label_entries.append((px, py + half_ext + 0.03, o.source, o.z, alpha))
+                label_entries.append((o.source, px, py + half_ext_h + 0.03, o.z, alpha, d))
 
-    for px, py, source, z, alpha in label_entries:
+    # one label per source per frame - the nearest (largest-alpha) image of
+    # each source wins, since multiple images of one source are the physics
+    # highlight, not a reason to print the same tag three times
+    best_by_source = {}
+    for source, px, py, z, alpha, d in label_entries:
+        if source not in best_by_source or alpha > best_by_source[source][3]:
+            best_by_source[source] = (px, py, z, alpha)
+
+    for source, (px, py, z, alpha) in best_by_source.items():
         ax.text(
             px,
             py,
