@@ -4,8 +4,9 @@ Build the 3D scene catalog for the Carousel flythrough.
 Reads:
   - papers/carousel-spectroscopic-survey/redshift_catalog_clean.txt
     (57 field/cluster galaxies + 1 foreground dwarf, with confident redshifts)
-  - lensed_sources.py (43 lensed images of 13 background sources, transcribed
-    from the paper's source table)
+  - lensed_sources.py (42 lensed images of 13 background sources, transcribed
+    from the paper's source table; 40 of them, of 12 sources, are rendered -
+    Source 10 has no confirmed redshift, see the note there)
 
 Produces a flat array of objects, each with a 3D comoving position (Mpc) and a
 category tag, saved to output/scene.npz for the renderer to consume.
@@ -30,17 +31,54 @@ CATALOG_PATH = os.path.join(
 )
 OUT_PATH = os.path.join(ROOT, "output/scene.npz")
 
-# Field center for transverse offsets, and therefore the axis the camera
-# flies along. This is the geometric centre of the MUSE frame, computed
-# through its WCS -- NOT CRVAL1/CRVAL2, which this file originally used.
-# CRPIX in muse-rgb.fits is ~(56.5, 94.5) of a 340x348 grid, so CRVAL sits
-# ~28" (-22.8" RA, +16.0" Dec) from the middle of the picture. Using CRVAL
-# both pasted the billboard ~28" off from the galaxies inside it and put the
-# camera axis almost exactly through Source 9 (6.7" off it, versus 28-57"
-# for every other source), which made Source 9 loom over the whole flight.
-FIELD_CENTER_RA, FIELD_CENTER_DEC, MUSE_HALF_W_ARCSEC, MUSE_HALF_H_ARCSEC = (
+# The axis the camera flies along: the main deflector of the lens, catalog
+# object 2444. This is L_a in papers/carousel-model, the galaxy its main
+# power-law lens profile is centred on (sections/modeling.tex). It is the
+# obvious thing to fly at - it is what does the lensing, and the central
+# image 4e sits 0.49" from it, so the flight ends looking straight down the
+# system's own axis of symmetry.
+#
+# Identified as L_a on three counts: 0.23" from the system's namesake
+# coordinate DESI-090.9854-35.9683; brightest cluster member in integrated
+# HST F140W flux (4022 vs 2202 for the runner-up); 0.49" from image 4e.
+# Note FGD is *not* this object - that is the z=0.086 foreground dwarf from
+# the survey paper, 15" away and unrelated to the lensing.
+#
+# Two earlier choices, both wrong, for the record: CRVAL1/CRVAL2 (which is
+# not the frame centre at all - CRPIX is ~(56.5, 94.5) of a 340x348 grid, so
+# CRVAL sits ~28" off the middle, and it put the axis almost exactly through
+# Source 9), then the MUSE frame's geometric centre (defensible, but 10.9"
+# from the deflector and centred on nothing in particular).
+DEFLECTOR_ID = "2444"
+
+# Frame geometry is still needed for the billboard's true footprint, and its
+# centre is still needed to *place* that billboard, which is no longer at the
+# scene origin. See BILLBOARD_X/Y in flythrough.py.
+MUSE_CENTER_RA, MUSE_CENTER_DEC, MUSE_HALF_W_ARCSEC, MUSE_HALF_H_ARCSEC = (
     muse_frame_geometry()
 )
+
+
+def _catalog_coord(object_id):
+    """(ra_deg, dec_deg) for one object in the redshift catalog.
+
+    Deliberately does not go through load_field_catalog(), which calls
+    sky_to_transverse_mpc(), which reads FIELD_CENTER_* - the very thing this
+    is used to define.
+    """
+    with open(CATALOG_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            oid, _z, ra_s, dec_s, _qop, _inst = line.split(",")
+            if oid == object_id:
+                c = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg))
+                return c.ra.deg, c.dec.deg
+    raise KeyError(f"{object_id} not found in {CATALOG_PATH}")
+
+
+FIELD_CENTER_RA, FIELD_CENTER_DEC = _catalog_coord(DEFLECTOR_ID)
 
 CLUSTER_Z = 0.4895  # biweight central redshift from the paper
 
@@ -49,8 +87,8 @@ COSMO = FlatLambdaCDM(H0=69.0, Om0=0.3)
 
 
 def sky_to_transverse_mpc(ra_deg, dec_deg, z):
-    """Comoving transverse (x, y) offset in Mpc from the field center, at
-    the object's own comoving distance (proper transverse comoving distance,
+    """Comoving transverse (x, y) offset in Mpc from the field center (the
+    main deflector, see DEFLECTOR_ID), at the object's own comoving distance (proper transverse comoving distance,
     i.e. angular offset * D_C, using a small-angle/tangent-plane approximation
     valid over this ~2' field).
 
@@ -165,6 +203,9 @@ def build_scene():
         OUT_PATH,
         field_center_ra=FIELD_CENTER_RA,
         field_center_dec=FIELD_CENTER_DEC,
+        deflector_id=DEFLECTOR_ID,
+        muse_center_ra=MUSE_CENTER_RA,
+        muse_center_dec=MUSE_CENTER_DEC,
         cluster_z=CLUSTER_Z,
         cluster_d_c=COSMO.comoving_distance(CLUSTER_Z).to(u.Mpc).value,
         **{f"field_{k}": v for k, v in field_arrs.items()},
@@ -174,6 +215,14 @@ def build_scene():
 
 
 def summarize(field_rows, lensed_rows):
+    print(
+        f"Camera axis: object {DEFLECTOR_ID} at "
+        f"{FIELD_CENTER_RA:.6f}, {FIELD_CENTER_DEC:.6f} (the main deflector)"
+    )
+    dra = (MUSE_CENTER_RA - FIELD_CENTER_RA) * 3600 * np.cos(np.radians(FIELD_CENTER_DEC))
+    ddec = (MUSE_CENTER_DEC - FIELD_CENTER_DEC) * 3600
+    print(f"  MUSE frame centre is {dra:+.2f}\" RA, {ddec:+.2f}\" Dec from it\n")
+
     cats = {}
     for r in field_rows:
         cats[r["category"]] = cats.get(r["category"], 0) + 1

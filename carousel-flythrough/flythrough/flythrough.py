@@ -19,7 +19,10 @@ import matplotlib.pyplot as plt
 from matplotlib.transforms import Bbox
 
 from prepare_data import (
+    CLUSTER_Z,
     COSMO,
+    MUSE_CENTER_DEC,
+    MUSE_CENTER_RA,
     MUSE_HALF_H_ARCSEC,
     MUSE_HALF_W_ARCSEC,
     load_field_catalog,
@@ -47,12 +50,19 @@ DURATION_S = 26.0
 N_FRAMES = int(FPS * DURATION_S)
 
 # Cluster billboard true footprint (340x348 px @ 0.2"/px), measured off the
-# frame's own WCS. The billboard is drawn centred on the origin, which is
-# only correct because the origin is the MUSE frame centre - see the
-# FIELD_CENTER note in prepare_data.py.
+# frame's own WCS.
 MUSE_W_ARCSEC = 2 * MUSE_HALF_W_ARCSEC
 MUSE_H_ARCSEC = 2 * MUSE_HALF_H_ARCSEC
-CLUSTER_D_C = COSMO.comoving_distance(0.4895).value
+CLUSTER_D_C = COSMO.comoving_distance(CLUSTER_Z).value
+
+# Where the billboard's own centre sits in scene coordinates. The scene origin
+# is the main deflector (see DEFLECTOR_ID in prepare_data.py), which is 10.9"
+# from the middle of the MUSE frame, so the photo is *not* centred on the
+# origin. Drawing it there anyway would slide it ~21% of its own half-width
+# off the galaxies it contains, and the cross-dissolve would visibly slip.
+BILLBOARD_X, BILLBOARD_Y, _ = sky_to_transverse_mpc(
+    MUSE_CENTER_RA, MUSE_CENTER_DEC, CLUSTER_Z
+)
 
 STAR_COLOR = (1.0, 1.0, 0.95)
 
@@ -164,9 +174,17 @@ class Object3D:
 def _in_billboard(stamp, d_c):
     """Is this object's light part of the MUSE billboard picture? Only if it
     was cut from the MUSE frame at all, and only if it sits at or behind the
-    cluster plane the billboard is pinned to."""
+    cluster plane the billboard is pinned to.
+
+    'muse_line' counts even though, strictly, it does not: those stamps are
+    narrow-band Lyman-alpha, which is exactly the light the broadband
+    billboard does *not* contain. Drawing them on top of it from frame one
+    would be honest and would also look like a separate overlay pasted over
+    the photo. Dissolving them in with everything else keeps one visual rule -
+    the picture resolves into its objects - and the emitters simply arrive as
+    the flat frame lets go."""
     return (
-        stamp["source"] in ("muse", "muse_arc")
+        stamp["source"] in ("muse", "muse_arc", "muse_line")
         and d_c >= CLUSTER_D_C - FOREGROUND_MARGIN_MPC
     )
 
@@ -190,7 +208,7 @@ def build_objects(field_rows, lensed_rows, stamps):
 
     # Images that share a connected footprint are cached under the first of
     # them (prepare_imagery drops the rest), so their catalog rows have no
-    # stamp and are skipped here. They are still 41 images in the field -
+    # stamp and are skipped here. They are still 40 images in the field -
     # some of them just touch, and get drawn as one piece of sky.
     for r in lensed_rows:
         s = stamps.get(f"img_{r['label']}")
@@ -267,7 +285,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
     )
 
     # --- cluster billboard (real MUSE image), placed at its true distance ---
-    # Centred on the origin, which is the MUSE frame's own centre, so the
+    # Projected at the MUSE frame's own centre, not the scene origin, so the
     # photo lands exactly on top of the galaxies it contains.
     bb_depth = CLUSTER_D_C - cam_z
     bb_alpha = billboard_alpha(cam_z) if bb_depth > NEAR_CLIP else 0.0
@@ -276,6 +294,8 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         half_h = np.radians(MUSE_H_ARCSEC / 3600.0 / 2.0) * CLUSTER_D_C
         bx = f * half_w / bb_depth
         by = f * half_h / bb_depth
+        bcx = f * BILLBOARD_X / bb_depth
+        bcy = f * BILLBOARD_Y / bb_depth
         if bx > 0.001:  # skip once absurdly small/far
             # feather the billboard's edge so it reads as a volume, not a
             # pasted rectangular card: fade alpha to 0 over the outer ~12%
@@ -293,7 +313,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             )
             ax.imshow(
                 billboard_rgba,
-                extent=(-bx, bx, -by, by),
+                extent=(bcx - bx, bcx + bx, bcy - by, bcy + by),
                 zorder=1,
                 interpolation="bilinear",
                 origin="lower",

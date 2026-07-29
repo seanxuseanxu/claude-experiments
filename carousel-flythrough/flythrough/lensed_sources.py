@@ -37,7 +37,18 @@ LENSED_IMAGES = [
     ("7a", "06:03:58.02", "-35:58:09.07", 1.627),
     ("7b", "06:03:56.98", "-35:58:21.89", 1.627),
     ("7c", "06:03:55.72", "-35:58:22.05", 1.627),
-    ("7d", "06:03:56.32", "-35:58:02.53", 1.627),
+    # 7d ("06:03:56.32", "-35:58:02.53") is excluded, the same way Source 10
+    # is: the paper's source table gives its redshift as "n.a. - Not firmly
+    # detected", because 7d is "both demagnified and blended with the light of
+    # a cluster galaxy" (Carousel Lens I, Known Sources). Paper II argues it is
+    # probably a real counter-image of Source 7, but there is no light of its
+    # own to draw: source7.fits has no detection for it, so it fell through to
+    # the circular MUSE fallback and rendered a 2.5" cutout centred 1.27" from
+    # cluster member 2399 (z=0.487) - i.e. a gold z~0.49 elliptical, drawn at
+    # z=1.627, ballooning to the largest object on screen mid-flight.
+    # Not recoverable from HST either: subtracting an azimuthal-median model of
+    # 2399 from F140W leaves S/N=0.7 at 7d's position, inside the -0.8..+1.3
+    # range of control apertures at the same radius.
 
     ("8a", "06:03:55.17", "-35:57:46.09", 3.549),
     ("8b", "06:03:55.75", "-35:57:41.46", 3.549),
