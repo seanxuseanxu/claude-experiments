@@ -220,9 +220,10 @@ __marimo__/
 # data files
 *.fits
 *.npy
+*.pdf
 
 # folders
-papers/*
+carousel-flythrough/papers/*
 
 # mac
-.DS_STORE
+.DS_Store
