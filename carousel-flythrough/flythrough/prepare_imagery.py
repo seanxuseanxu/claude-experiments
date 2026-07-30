@@ -28,6 +28,7 @@ from PIL import Image
 from prepare_data import load_field_catalog, load_lensed_sources
 from lensed_sources import LENSED_IMAGES, source_label
 from cutout_data import iter_cutouts, MUSE_PIXEL_SCALE_ARCSEC
+import galaxy_shapes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -578,6 +579,127 @@ def build_lensed_image_masks(muse_rgb, muse_wcs, skip_labels=frozenset()):
     return out
 
 
+def build_field_galaxy_masks(muse_rgb, muse_wcs, galaxy_shapes_dict):
+    """Build stamps for field galaxies using their real measured footprints from
+    galaxy_shapes.py, resampled to the MUSE pixel grid.
+
+    For each field-catalog label with a galaxy_shapes entry:
+      1. Resample the HST-resolution mask to MUSE pixel scale.
+      2. Feather the resampled mask into an alpha channel.
+      3. Crop MUSE RGB pixels at the measured bbox.
+      4. Apply exposure, return dict(rgba, half_width_arcsec, half_height_arcsec, ra, dec).
+
+    Galaxies outside the MUSE frame (or with degenerate crops) fall back to None
+    and must be handled by the circular-stamp fallback in build_all_stamps().
+
+    Returns: dict label -> dict(rgba, half_width_arcsec, half_height_arcsec, ra, dec).
+    """
+    out = {}
+    ny_muse, nx_muse = muse_rgb.shape[:2]
+
+    for label, gs in galaxy_shapes_dict.items():
+        # Get the HST mask and its pixel scale.
+        hst_mask = gs["mask"]  # bool array, HST pixel scale
+        hst_px_scale = gs["pixel_scale_arcsec"]  # e.g., 0.0698
+        muse_px_scale = MUSE_PIXEL_SCALE_ARCSEC  # 0.2
+
+        # Compute the resample factor: how many MUSE pixels per HST pixel.
+        resample_factor = hst_px_scale / muse_px_scale  # < 1, shrink the mask
+
+        # Resample the mask to MUSE pixel scale using scipy.ndimage.zoom.
+        # This preserves the angular footprint while changing the sampling grid.
+        resampled_mask = ndimage.zoom(
+            hst_mask.astype(float), resample_factor, order=1
+        )
+        resampled_mask = resampled_mask > 0.5  # back to binary
+
+        # Feather the resampled mask into an alpha channel.
+        alpha = ndimage.gaussian_filter(
+            resampled_mask.astype(float), ARC_FEATHER_SIGMA_PX
+        )
+        alpha = np.clip(alpha / max(alpha.max(), 1e-9), 0.0, 1.0)
+
+        # Get the bbox from galaxy_shapes (in RA/Dec).
+        bbox_ra = gs["bbox_ra"]
+        bbox_dec = gs["bbox_dec"]
+        hw_arcsec = gs["half_width_arcsec"]
+        hh_arcsec = gs["half_height_arcsec"]
+
+        # Convert bbox center to MUSE pixel coordinates.
+        px_center, py_center = muse_wcs.wcs_world2pix([[bbox_ra, bbox_dec]], 0)[0]
+        px_center = float(px_center)
+        py_center = float(py_center)
+
+        # Determine the pixel bounds of the resampled mask's bounding box in MUSE coords.
+        mask_ny, mask_nx = resampled_mask.shape
+        half_nx = mask_nx / 2.0
+        half_ny = mask_ny / 2.0
+
+        x0 = int(np.round(px_center - half_nx))
+        x1 = int(np.round(px_center + half_nx))
+        y0 = int(np.round(py_center - half_ny))
+        y1 = int(np.round(py_center + half_ny))
+
+        # Clip to the MUSE frame bounds.
+        x0_clipped = max(0, x0)
+        x1_clipped = min(nx_muse, x1)
+        y0_clipped = max(0, y0)
+        y1_clipped = min(ny_muse, y1)
+
+        # Check if the clipped crop is degenerate (too small).
+        crop_width = x1_clipped - x0_clipped
+        crop_height = y1_clipped - y0_clipped
+        if crop_width < 3 or crop_height < 3:
+            # Degenerate crop - skip and let the fallback handle it.
+            continue
+
+        # Crop the MUSE RGB at the clipped bounds.
+        crop = muse_rgb[y0_clipped : y1_clipped, x0_clipped : x1_clipped, :]
+
+        # Apply exposure.
+        boosted = apply_exposure(crop)
+
+        # Also crop the alpha and resampled mask to match the clipped region.
+        # The alpha/mask were computed for the full footprint; we need to extract
+        # the part that corresponds to the MUSE crop.
+        mask_x0 = x0_clipped - x0 if x0 < x0_clipped else 0
+        mask_x1 = mask_x0 + crop_width
+        mask_y0 = y0_clipped - y0 if y0 < y0_clipped else 0
+        mask_y1 = mask_y0 + crop_height
+
+        # Ensure we're within the mask bounds.
+        mask_x0 = max(0, min(mask_x0, mask_nx))
+        mask_x1 = max(mask_x0, min(mask_x1, mask_nx))
+        mask_y0 = max(0, min(mask_y0, mask_ny))
+        mask_y1 = max(mask_y0, min(mask_y1, mask_ny))
+
+        alpha_crop = alpha[mask_y0:mask_y1, mask_x0:mask_x1]
+
+        # If the crops don't match in shape, something went wrong - skip.
+        if alpha_crop.shape != crop.shape[:2]:
+            continue
+
+        # Build the RGBA array.
+        rgba = np.dstack([boosted, alpha_crop])
+
+        # Compute the actual sky position of the crop center in MUSE pixel space.
+        crop_center_x = (x0_clipped + x1_clipped) / 2.0
+        crop_center_y = (y0_clipped + y1_clipped) / 2.0
+        crop_ra, crop_dec = muse_wcs.wcs_pix2world(
+            [[crop_center_x, crop_center_y]], 0
+        )[0]
+
+        out[label] = dict(
+            rgba=rgba,
+            half_width_arcsec=hw_arcsec,
+            half_height_arcsec=hh_arcsec,
+            ra=float(crop_ra),
+            dec=float(crop_dec),
+        )
+
+    return out
+
+
 def _install_footprint_stamps(stamps, masks, counts, tag):
     """Overwrite the circular img_<label> entries with segmented footprints,
     collapsing each merged group onto its first member. Returns how many
@@ -615,7 +737,7 @@ def build_all_stamps():
     lensed_rows = load_lensed_sources()
 
     stamps = {}
-    counts = {"muse": 0, "hst": 0, "none": 0}
+    counts = {"muse": 0, "hst": 0, "none": 0, "field_real": 0}
     for r in field_rows + lensed_rows:
         rgba, source, radius = extract_stamp(r["ra"], r["dec"], muse_rgb, muse_wcs, hst_rgb, hst_wcs)
         key = r["label"] if "source" not in r else f"img_{r['label']}"
@@ -624,6 +746,35 @@ def build_all_stamps():
             half_width_arcsec=radius, half_height_arcsec=radius,
         )
         counts[source] += 1
+
+    # Measure field galaxy real footprints from HST and resample to MUSE.
+    print("Measuring field galaxy shapes from HST...")
+    galaxy_shapes_dict = galaxy_shapes.measure_galaxy_shapes()
+    print(f"  detected {len(galaxy_shapes_dict)} field galaxies with real footprints")
+
+    # Build stamps with real footprints for field galaxies that have HST detections.
+    print("Building field galaxy stamps with real footprints...")
+    field_real_stamps = build_field_galaxy_masks(muse_rgb, muse_wcs, galaxy_shapes_dict)
+
+    # Install the real-footprint stamps, overwriting the circular ones.
+    n_field_real = 0
+    for label, stamp in field_real_stamps.items():
+        if label in stamps:
+            # Overwrite the circular stamp with the real-footprint one.
+            old_source = stamps[label]["source"]
+            counts[old_source] -= 1
+            stamps[label] = dict(
+                rgba=stamp["rgba"],
+                source="field_real",
+                half_width_arcsec=stamp["half_width_arcsec"],
+                half_height_arcsec=stamp["half_height_arcsec"],
+                ra=stamp["ra"],
+                dec=stamp["dec"],
+            )
+            counts["field_real"] += 1
+            n_field_real += 1
+
+    print(f"  installed {n_field_real} field galaxy real-footprint stamps")
 
     # Lensed images with a data/cutouts/*.fits cubelet get their true
     # detected (generally non-circular) shape instead of the circular stamp
@@ -680,7 +831,8 @@ def build_all_stamps():
     )
 
     # dump a handful to disk for visual inspection, including a few
-    # high-elongation arcs to confirm shape (not circular) and clean edges
+    # high-elongation arcs to confirm shape (not circular) and clean edges,
+    # and a sample of field galaxies to confirm real footprints
     sample_keys = (
         list(stamps.keys())[:6]
         + [k for k in stamps if k.startswith("img_")][:6]
@@ -689,6 +841,11 @@ def build_all_stamps():
             for lbl in ("8a", "8c", "11a", "12a", "12d", "12e", "13b", "13c",
                         "13d", "13e", "4a", "4e", "6d")
             if f"img_{lbl}" in stamps
+        ]
+        + [
+            lbl
+            for lbl in ("2444", "2350", "2373", "2399", "2465", "2357")
+            if lbl in stamps
         ]
     )
     for k in dict.fromkeys(sample_keys):
