@@ -85,15 +85,54 @@ LAE_ALPHA_SN_HI = 3.0  # ...and where it reaches full opacity
 LAE_DILATE_PX = 2  # halo around the blob that the alpha ramp may fill
 LAE_FEATHER_SIGMA_PX = 1.2
 LAE_ARCSINH_SOFT = 8.0  # arcsinh softening for line-flux -> luminance
-LAE_LUM_FLOOR = 0.30  # keep faint outskirts coloured, not black (alpha fades)
-LAE_SATURATION = 0.85  # pull the spectral colour off the gamut edge a little
+LAE_LUM_FLOOR = 0.10  # keep faint outskirts coloured, not black (alpha fades)
+LAE_SATURATION = 0.35  # pull the spectral colour off the gamut edge
+
+# Saturation and the luminance floor are why the first version of these stamps
+# read as neon slabs pasted over the field. Not because they were bright - the
+# LAEs' 99th-percentile premultiplied luminance was 0.591, *below* the real
+# arcs (0.652) and the cluster galaxies (0.835) - but because they were the
+# only pure hues in a near-neutral picture. img_4c, a real arc, has mean RGB
+# [0.293, 0.293, 0.302], a max/min channel ratio of 1.0; img_12a had
+# [0.058, 0.385, 0.275], a ratio of 6.6, with green pinned at the top of the
+# gamut. Saturation 0.85 -> 0.35 takes that ratio to 1.5. The 0.30 floor was
+# the other half: it put a hard pedestal under every pixel above the S/N cut,
+# so the blob had no profile, just an edge. 0.10 restores the falloff and
+# costs only 8-14% of the rendered area (~4-7% linear), so the extension won
+# by dropping to a line-map threshold survives.
+#
+# Note the two have to move together, and not in the direction you would
+# guess: desaturating pushes every channel *toward white*, so it raises
+# apparent luminance. At saturation 0.35 the p99 goes 0.591 -> 0.804 with no
+# compensation - the fix for "too bright" would have made them brighter. Hence
+# the arc-matched normalisation at the end of build_linemap_stamps.
 
 # How the LAE colour is chosen. "lya_wavelength": the true observed
 # wavelength of Lyman-alpha rendered as a spectral colour - z=3.086 -> 4967 A
-# cyan, z=3.549 -> 5530 A yellow-green, z=4.090 -> 6188 A orange, so the
-# colour is a readout of redshift. "muse_hue": the broadband hue of the
-# source's own images (what the old stamps had). "lya_blend": LAE_BLEND_FRAC
-# of the way from the broadband hue to the spectral colour.
+# cyan-green, z=3.549 -> 5530 A yellow-green, z=4.090 -> 6188 A orange, so the
+# colour is a readout of redshift.
+#
+# The other two modes are kept for reference but are measured dead ends. Both
+# rest on the broadband hue of the source's own images, and there is no such
+# thing: the LAEs have no detectable continuum in MUSE. Measured straight off
+# the cube (data/cube.fits/cube.fits, three bands 4750-6100 / 6100-7600 /
+# 7600-9300 A, sky lines rejected via STAT, all three Lya windows masked,
+# 3-8 px annulus background, uncertainty from ~150 blank apertures of matched
+# area), the stacked total S/N per source is:
+#
+#     source 4 (control, detected in imaging)  13.2
+#     source 8                                  0.9
+#     source 11                                 0.1
+#     source 12                                 0.6
+#     source 13                                 4.3
+#
+# Source 4 comes back at S/N 13, so the method works; none of the four LAEs
+# does. Source 13's 4.3 is entirely image 13e (bands 1.09/2.91/3.31, ~30x
+# every other image of 13), which sits on the BCG - the same contamination
+# that made 13e gold in the first place. So "muse_hue" does not sample the
+# emitter, it samples whatever cluster galaxy happens to lie behind it, and
+# "lya_blend" samples half of that. This matches the survey paper, which has
+# three of the four invisible in imaging and detected in the IFU alone.
 LAE_COLOR_MODE = "lya_wavelength"
 LAE_BLEND_FRAC = 0.5
 
@@ -326,7 +365,18 @@ def linemap_colors(target_labels, stamps):
     return colors
 
 
-def build_linemap_stamps(muse_wcs, target_labels, colors):
+def _p99_luminance(rgba):
+    """99th percentile of premultiplied luminance over a stamp's lit pixels -
+    how bright the thing actually reads once composited, which is the quantity
+    that has to match between the line-map stamps and the broadband ones."""
+    a = rgba[..., 3]
+    lit = a > 0.05
+    if not lit.any():
+        return None
+    return float(np.percentile((rgba[..., :3] * a[..., None])[lit].sum(-1) / 3.0, 99))
+
+
+def build_linemap_stamps(muse_wcs, target_labels, colors, target_p99=None):
     """Same footprint segmentation as build_lensed_image_masks, but reading
     the cutout's line map for both shape and brightness instead of sampling
     muse-rgb.fits, and painting it a single assigned colour. See the
@@ -343,6 +393,12 @@ def build_linemap_stamps(muse_wcs, target_labels, colors):
         same bounding box cannot light up;
       - luminance is the arcsinh-stretched line flux, floored so the faint
         outskirts stay coloured while alpha takes them out.
+
+    With `target_p99`, the finished stamps are rescaled so their median
+    premultiplied p99 luminance matches it - see the note by LAE_SATURATION
+    for why this cannot be folded into the saturation setting. It is one scale
+    for all of them, not per stamp: the brightness differences between images
+    of one source are magnification, which is the physics on display here.
     """
     out = {}
     for path, data, stat, mask, centroids, dx, dy in iter_cutouts():
@@ -412,6 +468,25 @@ def build_linemap_stamps(muse_wcs, target_labels, colors):
                 merged_labels=names,
                 ra=float(ra),
                 dec=float(dec),
+            )
+
+    # Match the emitters' brightness to the real arcs beside them. Only the
+    # genuine Lyman-alpha stamps take part: a CHROMA_INHERIT entry (4e) is a
+    # continuum image that borrowed a sibling's colour and already carries its
+    # sibling's brightness level, so dragging it to the Lya level would undo
+    # exactly the fix that put it there.
+    if target_p99 is not None:
+        lya = [k for k in out if k not in CHROMA_INHERIT]
+        measured = [p for p in (_p99_luminance(out[k]["rgba"]) for k in lya) if p]
+        if measured:
+            scale = target_p99 / float(np.median(measured))
+            for k in lya:
+                rgba = out[k]["rgba"]
+                rgba[..., :3] = np.clip(rgba[..., :3] * scale, 0.0, 1.0)
+            print(
+                f"  line-map brightness x{scale:.2f} "
+                f"(p99 {np.median(measured):.3f} -> {target_p99:.3f}, "
+                f"matching the broadband arcs)"
             )
     return out
 
@@ -572,12 +647,27 @@ def build_all_stamps():
     )
 
     # colours for the line-map stamps are decided after the arc pass, because
-    # 4e inherits its chroma from 4a-4d's finished arc stamps
+    # 4e inherits its chroma from 4a-4d's finished arc stamps - and so is
+    # their brightness, which is normalised to the level those same arcs came
+    # out at rather than to a hard-coded number, so LAE_SATURATION stays a
+    # knob you can turn without the emitters silently changing brightness.
+    arc_p99 = [
+        p
+        for p in (
+            _p99_luminance(s["rgba"])
+            for s in stamps.values()
+            if s["source"] == "muse_arc"
+        )
+        if p
+    ]
     counts["muse_line"] = 0
     n_merged_away += _install_footprint_stamps(
         stamps,
         build_linemap_stamps(
-            muse_wcs, line_labels, linemap_colors(line_labels, stamps)
+            muse_wcs,
+            line_labels,
+            linemap_colors(line_labels, stamps),
+            target_p99=float(np.median(arc_p99)) if arc_p99 else None,
         ),
         counts, "muse_line",
     )

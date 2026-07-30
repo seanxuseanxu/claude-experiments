@@ -244,15 +244,28 @@ def billboard_alpha(cam_z):
 
 NEAR_CLIP = 3.0  # Mpc; objects closer than this to the camera are culled
 VIEW_HALF = 1.0  # normalized view-space half-extent (matches xlim/ylim)
-LABEL_FADE_IN_MPC = 500.0
-LABEL_FADE_OUT_MPC = 220.0
+# How far ahead of an object its label starts fading up. This is what sets how
+# long a label is legible, and 500 was much too short: at ~11 Mpc/frame the
+# ramp only reached full strength 75 Mpc out, giving a median 1.15 s per
+# source, and sources 9 and 11 - both far enough off-axis to leave the frame
+# edge early - got exactly one frame each, at peak alpha 0.17. 1400 gives a
+# median 3.87 s and brings 9 and 11 up to 2.8 / 3.0 s at peak alpha 0.82.
+#
+# The cost is crowding, which is why this is not larger: 1400 puts at most 6
+# labels on screen at once (mean 3.2), and at fontsize 11 no pair of label
+# boxes overlaps in any of the 780 frames. 2000 was tried and reaches 8.
+LABEL_FADE_IN_MPC = 1400.0
 
 
-def _alpha_for_depth_fade(depth, fade_in, fade_out):
-    """1.0 while approaching within fade_in Mpc, ramping down to 0 over
-    fade_out Mpc after passing (depth goes negative once behind the object's
-    own plane isn't quite right here -- depth is always > NEAR_CLIP for
-    visible objects, so 'after passing' means depth is small)."""
+def _alpha_for_depth_fade(depth, fade_in):
+    """Label opacity from the object's depth in front of the camera: 0 beyond
+    fade_in, ramping 0 -> 1 from fade_in down to fade_in * 0.15, then full
+    until the near clip.
+
+    There is deliberately no far-side fade here. An object never recedes in
+    this flight - the camera only moves forward - so the way a label ends is
+    the object swelling past the size cap, and that is handled by close_alpha
+    at the call site, which multiplies this."""
     if depth > fade_in:
         return 0.0
     if depth > fade_in * 0.15:
@@ -376,7 +389,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         )
 
         if o.kind == "lensed" and show_labels:
-            alpha = _alpha_for_depth_fade(d, LABEL_FADE_IN_MPC, LABEL_FADE_OUT_MPC) * close_alpha
+            alpha = _alpha_for_depth_fade(d, LABEL_FADE_IN_MPC) * close_alpha
             if alpha > 0.01:
                 label_entries.append((o.source, px, py + half_ext_h + 0.03, o.z, alpha, d))
 
@@ -394,7 +407,7 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
             py,
             f"Source {source}\nz={z:.3f}",
             color=(1.0, 0.9, 0.6, alpha),
-            fontsize=7,
+            fontsize=11,
             ha="center",
             va="bottom",
             zorder=5,
@@ -403,12 +416,20 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
 
     if show_hud:
         z_now = z_lookup(cam_z)
+        # D_A = D_C / (1+z), exact in a flat cosmology. Worth knowing before
+        # you read this off the screen: it is not monotonic. It climbs to
+        # 1773 Mpc at t = 15.8 s (z = 1.605) and then falls back to 1394 Mpc
+        # by the end, so 39% of the flight counts *down* even though the
+        # camera never stops moving forward. That is the real behaviour of
+        # angular diameter distance, not a bug, and D_C is printed underneath
+        # partly so there is a monotonic number to read it against.
+        d_a = cam_z / (1.0 + z_now)
         ax.text(
             -0.97,
             0.94,
-            f"z = {z_now:.3f}\nD_C = {cam_z:6.0f} Mpc",
+            f"z   = {z_now:.3f}\nD_A = {d_a:5.0f} Mpc\nD_C = {cam_z:5.0f} Mpc",
             color=(0.8, 1.0, 0.9),
-            fontsize=9,
+            fontsize=12,
             ha="left",
             va="top",
             zorder=10,

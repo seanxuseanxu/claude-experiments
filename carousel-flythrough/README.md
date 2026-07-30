@@ -8,7 +8,7 @@ screen is a real pixel cutout from the actual MUSE/HST imagery, placed at
 its true sky position and true cosmological distance; nothing is a
 synthetic glyph or symbol.
 
-**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~5.8MB)
+**Output:** `output/carousel_flythrough.mp4` (26s, 30fps, 1152×1152, ~6.9MB)
 
 The camera flies straight down the lens's own axis: the scene origin is the
 **main deflector**, catalog object `2444` — see "Camera axis" below.
@@ -43,7 +43,7 @@ Useful flags on `flythrough.py`:
   full video. Fast iteration loop for tuning camera/visual params. Combine with
   `--preview-frames N`, `--fig-size`, `--dpi`.
 - `--no-labels` — suppress the per-source "Source N, z=..." fading text tags.
-- `--no-hud` — suppress the corner `z = ... / D_C = ... Mpc` readout.
+- `--no-hud` — suppress the corner `z / D_A / D_C` readout.
 - `--out PATH` — write the mp4 somewhere other than the default.
 
 Labels/HUD can also be turned off by default by flipping `SHOW_LABELS` /
@@ -161,8 +161,14 @@ billboarded images + depth-based alpha fades + HUD text together). Key mechanics
   An earlier version drew a warm-gold glow circle behind each one; it read as bokeh on the
   distant arcs and as a flat tan disc on the near ones, and it is gone.
 - **Labels**: `"Source N\nz=..."` fading text near each lensed source as the camera
-  approaches/passes (`_alpha_for_depth_fade`, tuned by `LABEL_FADE_IN_MPC`/`LABEL_FADE_OUT_MPC`).
-- **HUD**: corner readout of current `z` and `D_C` in Mpc.
+  approaches (`_alpha_for_depth_fade`, tuned by `LABEL_FADE_IN_MPC`). Each source is
+  legible for ~3.9 s (median, alpha > 0.15). There is a genuine label-free stretch
+  around t ≈ 16.5 s: nothing in the catalog sits between z ≈ 1.7 and z = 3.086.
+- **HUD**: corner readout of current `z`, `D_A` and `D_C` in Mpc. `D_A = D_C/(1+z)`,
+  exact in a flat cosmology. It is *not* monotonic — it peaks at 1773 Mpc at
+  t = 15.8 s (z = 1.605) and falls to 1394 Mpc by the end, so 39% of the flight
+  counts down while the camera keeps moving forward. That is real, and `D_C` is
+  printed under it partly to give the viewer a monotonic number to read it against.
 - **Starfield**: a small fixed set of background points at large fixed distance
   (`build_starfield`), purely atmospheric — unrelated to any catalog data.
 - **Encoding**: raw RGBA canvas buffer per frame (`fig.canvas.buffer_rgba()`) → `imageio` with
@@ -203,6 +209,15 @@ billboarded images + depth-based alpha fades + HUD text together). Key mechanics
   origin. Change the origin without changing `BILLBOARD_X/Y` and the two drift apart with
   nothing in the renderer complaining. `check_registration.py` measures the bulk offset
   between the two placements and asserts it is under 0.02″.
+- **Desaturating a colour makes it brighter.** Pulling a spectral hue off the gamut edge
+  raises the channels that were low, so it raises luminance — the Lyman-α stamps' p99 goes
+  0.591 → 0.804 on saturation alone. Any change to `LAE_SATURATION` has to be paired with
+  the brightness normalisation, which is why that is derived from the arcs at build time
+  rather than hard-coded.
+- **"Too bright" is usually chroma, not luminance.** The Lyman-α stamps were measurably
+  *dimmer* than the arcs and galaxies around them and still dominated the frame, because
+  they were the only pure hues in a near-neutral picture. Measure the max/min channel ratio
+  before reaching for a brightness knob.
 
 ## Real arc shapes (added 2026-07-29)
 
@@ -333,8 +348,54 @@ wavelength of their own Lyman-α:
 | 11 | 4.090 | 6188 Å | orange |
 
 so the colour of an emitter is a direct readout of its redshift. Set by
-`LAE_COLOR_MODE`; `"muse_hue"` (the old broadband hue) and `"lya_blend"` (half
-way between) are implemented alternatives.
+`LAE_COLOR_MODE`. The two alternatives, `"muse_hue"` (the old broadband hue) and
+`"lya_blend"` (half way between), are still implemented but are **measured dead
+ends** — see below.
+
+**There is no true broadband colour to recover.** Measured straight off the MUSE
+cube (`data/cube.fits/cube.fits` — a 3.5 GB IFU datacube nothing else in this
+pipeline reads): three bands 4750–6100 / 6100–7600 / 7600–9300 Å, sky lines
+rejected using the cube's own `STAT` plane, all three Lyα windows masked, 3–8 px
+annulus background, uncertainty from ~150 blank apertures of matched area.
+
+| source | b1 | b2 | b3 | total S/N |
+|---|---|---|---|---|
+| 4 (control — real galaxy, detected in imaging) | 0.955 | 1.309 | 1.300 | **13.2** |
+| 8 | 0.095 | 0.100 | 0.062 | 0.9 |
+| 11 | 0.025 | 0.032 | 0.006 | 0.1 |
+| 12 | 0.037 | 0.069 | 0.010 | 0.6 |
+| 13 | 0.156 | 0.455 | 0.483 | 4.3 |
+
+Source 4 comes back at S/N 13, so the method works; none of the four LAEs does.
+Source 13's 4.3 is entirely image `13e` (bands 1.09/2.91/3.31, ~30× every other
+image of 13), which sits on the BCG — the same contamination that made `13e` gold
+in the first place, and `4e` returns S/N 83 for the same reason. So `"muse_hue"`
+does not sample the emitter; it samples whichever cluster galaxy happens to lie
+along the sightline. Matches the survey paper, which has three of the four
+invisible in imaging and detected in the IFU alone.
+
+**Saturation and luminance floor.** The first version of these stamps read as
+neon slabs, but not because they were bright: their 99th-percentile premultiplied
+luminance was 0.591, *below* the real arcs (0.652) and the cluster galaxies
+(0.835). It was chroma. The rest of the picture is near-neutral — `img_4c`, a
+real arc, has mean RGB `[0.293, 0.293, 0.302]`, a max/min channel ratio of 1.0 —
+while `img_12a` was `[0.058, 0.385, 0.275]`, a ratio of 6.6, with green pinned at
+the top of the gamut. `LAE_SATURATION` 0.85 → 0.35 takes that ratio to 1.5. The
+old `LAE_LUM_FLOOR = 0.30` was the other half: a hard pedestal under every pixel
+above the S/N cut, so the blob had no profile, only an edge. 0.10 restores the
+falloff at a cost of 8–14% of the rendered area (~4–7% linear), so the extension
+won by moving to a line-map threshold survives.
+
+The two have to move together, and not in the intuitive direction: desaturating
+pushes every channel *toward white*, so it raises apparent luminance. At
+saturation 0.35 the p99 goes 0.591 → 0.804 with no compensation — the fix for
+"too bright" would have made them brighter. So `build_linemap_stamps` takes a
+`target_p99` and rescales the finished stamps to match the median of the
+broadband arcs built in the pass before it (×0.81 at current settings, printed at
+build time). One scale for all of them, not per stamp: the brightness differences
+*between* images of one source are magnification, which is the physics on
+display. `CHROMA_INHERIT` entries (`4e`) are excluded from both the measurement
+and the scale — see below.
 
 The same switch fixes the "LAEs look too small" complaint, because it removes
 the reason the threshold had to be high: a broadband cut has to stay at S/N 2
@@ -374,14 +435,21 @@ image still on the circular path, and it is faint and small enough to leave.
 - FOV / how large things appear: `FOV_DEG`.
 - When the billboard gives way to individual galaxies: `DISSOLVE_START_DEPTH`,
   `DISSOLVE_END_DEPTH`.
-- Label timing/fade: `LABEL_FADE_IN_MPC`, `LABEL_FADE_OUT_MPC`.
+- Label timing/fade: `LABEL_FADE_IN_MPC` (currently 1400, ≈3.9 s per source) and the
+  `fontsize` in the label `ax.text` (currently 11). Raising the fade further crowds the
+  frame: 1400 puts at most 6 labels up at once, 2000 puts up 8.
 - Stamp exposure/contrast for faint sources: `EXPOSURE_TARGET`, `EXPOSURE_MAX_GAIN` in
   `prepare_imagery.py`. Keep the gain floored at 1.0 or bright stamps stop matching the
   billboard and the cross-dissolve starts to show a seam.
 - Stamp cutout size: `STAMP_RADIUS_ARCSEC` in `prepare_imagery.py` (currently 2.5″;
   re-run `prepare_imagery.py` after changing).
 - Lyman-α emitter colour: `LAE_COLOR_MODE` (`"lya_wavelength"` / `"muse_hue"` /
-  `"lya_blend"`, plus `LAE_BLEND_FRAC`) and `LAE_SATURATION` in `prepare_imagery.py`.
+  `"lya_blend"`, plus `LAE_BLEND_FRAC`) and `LAE_SATURATION` (currently 0.35) in
+  `prepare_imagery.py`. `LAE_SATURATION` is safe to turn on its own — the brightness
+  normalisation is derived at build time from the arcs, so it re-matches automatically.
+  Note the other two colour modes are known-bad; see the continuum S/N table above.
+- Lyman-α emitter brightness: `LAE_LUM_FLOOR` (currently 0.10) for the faint end, and
+  the `target_p99` passed to `build_linemap_stamps` for the overall level.
 - Lyman-α emitter size: `LAE_SN_THRESHOLD` (currently 1.0). Lowering it further keeps
   growing them, but re-check for new blob merges — the printed "contiguous footprint"
   lines from `prepare_imagery.py` are the audit trail.
