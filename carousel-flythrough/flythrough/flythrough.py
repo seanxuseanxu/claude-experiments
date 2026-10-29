@@ -424,10 +424,14 @@ def render_frame(ax, cam_z, objects, starfield, billboard_img, z_lookup, show_la
         # angular diameter distance, not a bug, and D_C is printed underneath
         # partly so there is a monotonic number to read it against.
         d_a = cam_z / (1.0 + z_now)
+        # lookback time to the camera's redshift, same cosmology as everything
+        # else (COSMO). One scalar integral per frame, so no lookup grid needed.
+        t_lb = COSMO.lookback_time(z_now).value  # Gyr
         ax.text(
             -0.97,
             0.94,
-            f"z   = {z_now:.3f}\nD_A = {d_a:5.0f} Mpc\nD_C = {cam_z:5.0f} Mpc",
+            f"z   = {z_now:.3f}\nt_L = {t_lb:5.2f} Gyr\n"
+            f"D_A = {d_a:5.0f} Mpc\nD_C = {cam_z:5.0f} Mpc",
             color=(0.8, 1.0, 0.9),
             fontsize=12,
             ha="left",
